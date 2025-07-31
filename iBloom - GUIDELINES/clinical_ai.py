@@ -286,7 +286,7 @@ class ClinicalAIAssistant:
 
         # Initialize OpenAI client if API key is available
         api_key = os.getenv('OPENAI_API_KEY')
-        if api_key and api_key != 'your-openai-api-key-here':
+        if api_key and api_key != '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':
             try:
                 self.client = openai.OpenAI(api_key=api_key)
                 self.openai_available = True
@@ -315,7 +315,7 @@ class ClinicalAIAssistant:
 
         try:
             response = self.client.chat.completions.create(
-                model="gpt-4",
+                model="gpt-4o-mini",
                 messages=[
                     {
                         "role": "system",
@@ -348,6 +348,49 @@ class ClinicalAIAssistant:
         except Exception as e:
             print(f"Error generating clinical analysis: {e}")
             return self._generate_fallback_analysis(user_responses, burnout_score, clinical_context)
+
+    def _build_clinical_prompt(self, responses: Dict, score: float, context: str) -> str:
+        """Build enhanced prompt for AI analysis with specific recommendation generation"""
+        return f"""
+Based on the following evidence-based clinical guidelines, provide a comprehensive analysis of this workplace burnout assessment:
+
+CLINICAL GUIDELINES CONTEXT:
+{context}
+
+USER ASSESSMENT DATA:
+Burnout Score: {score}/10
+Detailed User Responses: {json.dumps(responses, indent=2)}
+
+Please provide a thorough clinical analysis with these specific sections:
+
+1. CLINICAL ASSESSMENT:
+- Based on the provided clinical guidelines, what does this assessment reveal?
+- Which specific clinical indicators or risk factors are present?
+- How do the responses align with established burnout criteria?
+
+2. RISK EVALUATION:
+- What is the current risk level and why?
+- Which responses are most concerning from a clinical perspective?
+- What patterns indicate potential progression of burnout?
+
+3. PERSONALIZED RECOMMENDATIONS:
+Generate exactly 3 detailed, actionable recommendations based specifically on what the user shared in their responses. Each recommendation should:
+- Address the specific issues mentioned in their answers
+- Be based on evidence from the clinical guidelines provided
+- Include concrete steps the person can take
+- Explain why this recommendation will help their particular situation
+- Reference relevant clinical evidence or interventions
+
+4. PROFESSIONAL HELP ASSESSMENT:
+- Based on the responses and clinical guidelines, should this person seek professional help?
+- If yes, what type of professional support would be most beneficial?
+
+5. EVIDENCE SOURCES:
+- Cite specific guidelines or evidence that support your recommendations
+- Include evidence levels when available
+
+Focus especially on the user's specific responses and tailor recommendations to address their particular workplace challenges and stressors.
+"""
 
     def _generate_fallback_analysis(self, user_responses: Dict, burnout_score: float, clinical_context: str) -> Dict:
         """Generate analysis without OpenAI using clinical guidelines"""
@@ -401,28 +444,6 @@ class ClinicalAIAssistant:
             'clinical_sources': self._extract_sources_used(clinical_context),
             'confidence': self._calculate_confidence(clinical_context)
         }
-
-    def _build_clinical_prompt(self, responses: Dict, score: float, context: str) -> str:
-        """Build prompt with clinical context"""
-        return f"""
-Based on the following evidence-based clinical guidelines, analyze this workplace burnout assessment:
-
-CLINICAL GUIDELINES CONTEXT:
-{context}
-
-USER ASSESSMENT DATA:
-Burnout Score: {score}/10
-User Responses: {json.dumps(responses, indent=2)}
-
-Please provide:
-1. Clinical assessment based on provided guidelines
-2. Evidence-based recommendations with citations
-3. Risk level evaluation
-4. Specific interventions supported by the evidence
-5. When to seek professional help
-
-Focus on evidence from the provided clinical sources. Cite specific guidelines used.
-"""
 
     def _parse_ai_analysis(self, analysis: str) -> Dict:
         """Parse AI analysis into structured format"""
