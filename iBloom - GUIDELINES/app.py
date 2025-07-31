@@ -18,9 +18,17 @@ app = Flask(__name__)
 app.config['SECRET_KEY'] = os.environ.get('FLASK_SECRET_KEY', 'dev-secret-key-change-this')
 app.config['SQLALCHEMY_DATABASE_URI'] = os.environ.get('DATABASE_URL', 'sqlite:///bloom.db')
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
-# Initialize clinical AI system
-init_clinical_ai(app)
+
 db = SQLAlchemy(app)
+
+# Initialize clinical AI system
+print("🌟 Initializing clinical AI system...")
+try:
+    init_clinical_ai(app)
+    print("✅ Clinical AI system initialized successfully")
+except Exception as e:
+    print(f"⚠️  Warning: Clinical AI initialization failed: {e}")
+    print("   App will continue with basic functionality")
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -177,7 +185,8 @@ def health():
                 'user_registration': 'available',
                 'data_export': 'available',
                 'company_analytics': 'available',
-                'emergency_help': 'available'
+                'emergency_help': 'available',
+                'clinical_ai': 'available' if get_clinical_ai() else 'disabled'
             }
         })
     except Exception as e:
@@ -237,44 +246,44 @@ def get_fallback_questions():
     return [
         {
             'id': 1,
-            'question': 'How would you rate your energy level today?',
+            'question': 'How emotionally drained do you feel from your work responsibilities?',
             'type': 'scale',
-            'scale_label': '1 = Very Low Energy,10 = Very High Energy',
-            'category': 'energy'
+            'scale_label': '1 = Not drained at all,10 = Completely exhausted',
+            'category': 'emotional_exhaustion'
         },
         {
             'id': 2,
-            'question': 'How satisfied do you feel with your work today?',
+            'question': 'How much control do you feel you have over your work demands?',
             'type': 'scale',
-            'scale_label': '1 = Very Dissatisfied,10 = Very Satisfied',
-            'category': 'satisfaction'
+            'scale_label': '1 = No control,10 = Complete control',
+            'category': 'job_control'
         },
         {
             'id': 3,
-            'question': 'How stressed do you feel right now?',
-            'type': 'scale',
-            'scale_label': '1 = Not Stressed,10 = Extremely Stressed',
-            'category': 'stress'
+            'question': 'What specific work situations or tasks are causing you the most stress this week?',
+            'type': 'text',
+            'placeholder': 'Describe specific stressors, deadlines, conflicts, or challenges...',
+            'category': 'work_stressors'
         },
         {
             'id': 4,
-            'question': 'How well are you able to balance work and personal life?',
-            'type': 'scale',
-            'scale_label': '1 = Poor Balance,10 = Excellent Balance',
-            'category': 'balance'
+            'question': 'How has your work been affecting your personal life and relationships recently?',
+            'type': 'text',
+            'placeholder': 'Share how work impacts your time, energy, mood, or relationships...',
+            'category': 'work_life_impact'
         },
         {
             'id': 5,
-            'question': 'Is there anything specific that made work challenging today?',
+            'question': 'What would need to change at work for you to feel more supported and less stressed?',
             'type': 'text',
-            'placeholder': 'Share anything that affected your well-being today...',
-            'category': 'challenges'
+            'placeholder': 'Describe changes in workload, support, resources, or environment...',
+            'category': 'support_needs'
         }
     ]
 
 @app.route('/api/questions')
 def get_questions():
-    """Generate personalized questions for user"""
+    """Generate personalized questions using clinical AI guidelines"""
     try:
         user_id = session.get('user_id')
         if not user_id:
@@ -289,149 +298,590 @@ def get_questions():
         user.last_active = datetime.utcnow()
         db.session.commit()
 
-        # For now, use fallback questions
-        # In production, this would call AI service to generate personalized questions
-        questions = get_fallback_questions()
+        # Get clinical AI instance
+        clinical_ai = get_clinical_ai()
 
-        # Could personalize based on user's previous responses, department, etc.
-        # For example, add department-specific questions
-        if user.department == 'engineering':
-            questions.append({
-                'id': 6,
-                'question': 'How manageable is your current coding workload?',
-                'type': 'scale',
-                'scale_label': '1 = Overwhelming,10 = Very Manageable',
-                'category': 'workload'
-            })
-        elif user.department == 'sales':
-            questions.append({
-                'id': 6,
-                'question': 'How confident do you feel about meeting your targets?',
-                'type': 'scale',
-                'scale_label': '1 = Not Confident,10 = Very Confident',
-                'category': 'confidence'
-            })
-
-        # Randomize question order for variety
-        random.shuffle(questions)
-        questions = questions[:5]  # Limit to 5 questions
+        if clinical_ai and clinical_ai.kb.collection:
+            # Use clinical AI to generate evidence-based questions
+            questions = generate_clinical_questions(user, clinical_ai)
+            logger.info(f"Generated {len(questions)} clinical AI questions for user {user_id[:8]}...")
+        else:
+            # Fallback to basic questions if clinical AI not available
+            questions = get_fallback_questions()
+            logger.info(f"Using fallback questions for user {user_id[:8]}... (Clinical AI not available)")
 
         return jsonify({
             'questions': questions,
             'user_context': {
                 'department': user.department,
                 'days_active': (datetime.utcnow() - user.created_at).days
-            }
+            },
+            'clinical_ai_enabled': clinical_ai is not None
         })
 
     except Exception as e:
         logger.error(f"Question generation error: {str(e)}")
         return jsonify({'error': 'Failed to generate questions'}), 500
 
-# ==================== RESPONSE SUBMISSION ====================
+def generate_clinical_questions(user, clinical_ai):
+    """Generate 5 questions: 3 open-ended + 2 scale questions based on clinical guidelines"""
+
+    # Get user's recent responses for context
+    recent_responses = DailyResponse.query.filter_by(user_id=user.id) \
+        .order_by(DailyResponse.created_at.desc()) \
+        .limit(3).all()
+
+    recent_concerns = []
+    avg_score = 50  # default
+
+    if recent_responses:
+        scores = [r.burnout_score for r in recent_responses if r.burnout_score is not None]
+        if scores:
+            avg_score = sum(scores) / len(scores)
+
+        for response in recent_responses:
+            if response.concerns:
+                try:
+                    concerns = json.loads(response.concerns)
+                    recent_concerns.extend(concerns)
+                except json.JSONDecodeError:
+                    pass
+
+    # Query clinical guidelines for relevant assessment tools
+    kb = clinical_ai.kb
+
+    # Build query based on user context
+    query_parts = []
+    if avg_score > 70:
+        query_parts.append("severe burnout assessment high risk clinical evaluation")
+    elif avg_score > 40:
+        query_parts.append("moderate burnout workplace stress assessment")
+    else:
+        query_parts.append("burnout prevention screening wellbeing assessment")
+
+    if user.department:
+        query_parts.append(f"{user.department} workplace")
+
+    query = " ".join(query_parts)
+
+    # Get relevant clinical guidelines
+    guidelines = kb.query_guidelines(query, n_results=3)
+
+    # Extract clinical context for question generation
+    clinical_context = ""
+    for guideline in guidelines:
+        clinical_context += f"{guideline['content'][:200]}... "
+
+    questions = []
+
+    # Generate 2 SCALE questions using clinical AI
+    scale_questions = generate_ai_scale_questions(clinical_context, user, avg_score)
+    questions.extend(scale_questions)
+
+    # Generate 3 OPEN-ENDED questions using clinical AI
+    open_questions = generate_ai_open_questions(clinical_context, user, recent_concerns)
+    questions.extend(open_questions)
+
+    # Ensure we have exactly 5 questions and add sequential IDs
+    questions = questions[:5]
+    for i, q in enumerate(questions):
+        q['id'] = i + 1
+
+    return questions
+
+def generate_ai_scale_questions(clinical_context, user, avg_score):
+    """Generate 2 AI-powered scale questions based on clinical guidelines"""
+
+    clinical_ai = get_clinical_ai()
+    if not clinical_ai or not clinical_ai.openai_available:
+        # Fallback scale questions
+        return [
+            {
+                'question': 'How emotionally exhausted do you feel from work today?',
+                'type': 'scale',
+                'scale_label': '1 = Not exhausted at all, 10 = Completely drained',
+                'category': 'emotional_exhaustion',
+                'clinical_basis': 'MBI Emotional Exhaustion Scale'
+            },
+            {
+                'question': 'How much control do you feel you have over your work demands?',
+                'type': 'scale',
+                'scale_label': '1 = No control, 10 = Complete control',
+                'category': 'job_control',
+                'clinical_basis': 'Job Demands-Control Model'
+            }
+        ]
+
+    try:
+        prompt = f"""
+        Based on these clinical guidelines for workplace burnout assessment:
+        
+        {clinical_context}
+        
+        Generate exactly 2 scale-based questions (1-10 rating) for assessing workplace burnout and stress. 
+        
+        User context:
+        - Department: {user.department or 'General'}  
+        - Current risk level: {'High' if avg_score > 70 else 'Moderate' if avg_score > 40 else 'Low'}
+        
+        Requirements:
+        - Questions should be based on validated clinical scales (MBI, BJSQ, Job Demands-Control, etc.)
+        - 1-10 scale format with clear anchor points
+        - Focus on key burnout indicators: emotional exhaustion, depersonalization, personal accomplishment, job demands, control
+        - Make questions specific and actionable
+        
+        Return in this JSON format:
+        {{
+            "questions": [
+                {{
+                    "question": "question text",
+                    "type": "scale",
+                    "scale_label": "1 = anchor point, 10 = anchor point", 
+                    "category": "category_name",
+                    "clinical_basis": "source scale/model"
+                }}
+            ]
+        }}
+        """
+
+        response = clinical_ai.client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "You are a clinical psychologist expert in workplace mental health assessment. Generate evidence-based burnout assessment questions."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.7,
+            max_tokens=800
+        )
+
+        ai_response = json.loads(response.choices[0].message.content)
+        return ai_response.get('questions', [])[:2]  # Ensure exactly 2 questions
+
+    except Exception as e:
+        logger.error(f"AI scale question generation failed: {e}")
+        # Return fallback questions
+        return [
+            {
+                'question': 'How emotionally drained do you feel from your work responsibilities?',
+                'type': 'scale',
+                'scale_label': '1 = Not drained at all, 10 = Completely exhausted',
+                'category': 'emotional_exhaustion',
+                'clinical_basis': 'MBI Emotional Exhaustion Scale'
+            },
+            {
+                'question': 'How often do you feel overwhelmed by your workload?',
+                'type': 'scale',
+                'scale_label': '1 = Never overwhelmed, 10 = Constantly overwhelmed',
+                'category': 'work_overload',
+                'clinical_basis': 'Job Demands-Resources Model'
+            }
+        ]
+
+def generate_ai_open_questions(clinical_context, user, recent_concerns):
+    """Generate 3 AI-powered open-ended questions based on clinical guidelines"""
+
+    clinical_ai = get_clinical_ai()
+    if not clinical_ai or not clinical_ai.openai_available:
+        # Fallback open questions
+        return [
+            {
+                'question': 'What specific work situations or tasks are causing you the most stress this week?',
+                'type': 'text',
+                'placeholder': 'Describe specific stressors, deadlines, conflicts, or challenges...',
+                'category': 'work_stressors',
+                'clinical_basis': 'Clinical Interview Assessment'
+            },
+            {
+                'question': 'How has your work been affecting your personal life and relationships recently?',
+                'type': 'text',
+                'placeholder': 'Share how work impacts your time, energy, mood, or relationships...',
+                'category': 'work_life_impact',
+                'clinical_basis': 'Work-Life Balance Assessment'
+            },
+            {
+                'question': 'What would need to change at work for you to feel more supported and less stressed?',
+                'type': 'text',
+                'placeholder': 'Describe changes in workload, support, resources, or environment...',
+                'category': 'support_needs',
+                'clinical_basis': 'Intervention Planning Assessment'
+            }
+        ]
+
+    try:
+        concerns_context = f"Previous concerns: {', '.join(recent_concerns[:3])}" if recent_concerns else "No previous concerns noted"
+
+        prompt = f"""
+        Based on these clinical guidelines for workplace burnout assessment:
+        
+        {clinical_context}
+        
+        Generate exactly 3 open-ended questions for clinical assessment of workplace burnout and stress.
+        
+        User context:
+        - Department: {user.department or 'General'}
+        - {concerns_context}
+        
+        Requirements:
+        - Questions should elicit detailed responses about specific workplace stressors
+        - Based on clinical interview best practices for burnout assessment  
+        - Focus on: work stressors, coping mechanisms, support systems, work-life impact, intervention needs
+        - Questions should be empathetic and professional
+        - Help identify specific areas for intervention
+        
+        Return in this JSON format:
+        {{
+            "questions": [
+                {{
+                    "question": "question text",
+                    "type": "text", 
+                    "placeholder": "helpful placeholder text",
+                    "category": "category_name",
+                    "clinical_basis": "clinical rationale"
+                }}
+            ]
+        }}
+        """
+
+        response = clinical_ai.client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "You are a clinical psychologist conducting a workplace mental health assessment. Generate thoughtful, evidence-based open-ended questions."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.8,
+            max_tokens=1000
+        )
+
+        ai_response = json.loads(response.choices[0].message.content)
+        return ai_response.get('questions', [])[:3]  # Ensure exactly 3 questions
+
+    except Exception as e:
+        logger.error(f"AI open question generation failed: {e}")
+        # Return fallback questions
+        return [
+            {
+                'question': 'Describe the most challenging aspects of your current work situation',
+                'type': 'text',
+                'placeholder': 'Share specific challenges, stressors, or difficult situations you are facing...',
+                'category': 'work_challenges',
+                'clinical_basis': 'Clinical Interview Assessment'
+            },
+            {
+                'question': 'How do you currently cope with work-related stress, and how effective are these strategies?',
+                'type': 'text',
+                'placeholder': 'Describe your coping methods and whether they help...',
+                'category': 'coping_strategies',
+                'clinical_basis': 'Coping Assessment'
+            },
+            {
+                'question': 'What kind of support or changes would be most helpful for improving your work experience?',
+                'type': 'text',
+                'placeholder': 'Describe what support, resources, or changes would help most...',
+                'category': 'support_preferences',
+                'clinical_basis': 'Intervention Preference Assessment'
+            }
+        ]
+
+# ==================== AI-POWERED RECOMMENDATIONS ====================
+
+def generate_personalized_ai_recommendations(user_responses, burnout_score, clinical_context):
+    """Generate personalized recommendations using AI based on specific user responses"""
+
+    clinical_ai = get_clinical_ai()
+    if not clinical_ai or not clinical_ai.openai_available:
+        return get_smart_fallback_recommendations(user_responses, burnout_score)
+
+    try:
+        # Create detailed prompt for recommendation generation
+        prompt = f"""
+        Based on these clinical guidelines for workplace burnout:
+        
+        {clinical_context}
+        
+        USER'S SPECIFIC RESPONSES:
+        {json.dumps(user_responses, indent=2)}
+        
+        BURNOUT RISK SCORE: {burnout_score}/100
+        
+        Generate exactly 3 personalized, detailed recommendations that directly address what this specific user shared in their responses.
+        
+        Requirements for each recommendation:
+        1. Must be directly relevant to what the user described in their answers
+        2. Should be evidence-based using the clinical guidelines provided
+        3. Include specific, actionable steps they can implement
+        4. Explain how this will help their particular situation
+        5. Be 2-3 sentences long with practical details
+        
+        Return in this JSON format:
+        {{
+            "recommendations": [
+                {{
+                    "action": "detailed recommendation text addressing their specific situation",
+                    "rationale": "why this helps their particular case based on clinical evidence",
+                    "implementation": "specific steps to take",
+                    "evidence_basis": "clinical guideline or research that supports this"
+                }}
+            ]
+        }}
+        
+        Focus on their actual responses - if they mentioned specific stressors, address those. If they described particular challenges, provide solutions for those exact issues.
+        """
+
+        response = clinical_ai.client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You are a clinical psychologist specializing in workplace mental health. Generate personalized, evidence-based recommendations that directly address the specific issues each individual describes in their responses."
+                },
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ],
+            temperature=0.3,  # Lower temperature for more focused, relevant recommendations
+            max_tokens=1200
+        )
+
+        ai_response = json.loads(response.choices[0].message.content)
+        recommendations = ai_response.get('recommendations', [])
+
+        # Format for app
+        formatted_recommendations = []
+        for i, rec in enumerate(recommendations[:3]):
+            formatted_recommendations.append({
+                'action': f"{rec['action']} {rec['implementation']}",
+                'rationale': rec.get('rationale', ''),
+                'type': 'personalized_ai',
+                'priority': 'high' if i == 0 else 'medium',
+                'evidence_based': True,
+                'evidence_basis': rec.get('evidence_basis', 'Clinical guidelines')
+            })
+
+        logger.info(f"Generated {len(formatted_recommendations)} personalized AI recommendations")
+        return formatted_recommendations
+
+    except Exception as e:
+        logger.error(f"AI recommendation generation failed: {e}")
+        return get_smart_fallback_recommendations(user_responses, burnout_score)
+
+def get_smart_fallback_recommendations(user_responses, burnout_score):
+    """Generate smart fallback recommendations based on user responses when AI fails"""
+    recommendations = []
+
+    # Analyze user responses for keywords to provide relevant fallbacks
+    all_responses_text = ""
+    for response in user_responses.values():
+        if isinstance(response, str):
+            all_responses_text += response.lower() + " "
+
+    # High stress indicators
+    if burnout_score > 70 or any(word in all_responses_text for word in ['overwhelmed', 'exhausted', 'burned', 'too much']):
+        recommendations.append({
+            'action': 'Given your high stress levels, prioritize immediate stress reduction through the 4-7-8 breathing technique: breathe in for 4 counts, hold for 7, exhale for 8. Practice this 3 times daily and especially when you notice stress building. Research shows this activates your parasympathetic nervous system and can reduce cortisol levels within minutes.',
+            'type': 'immediate',
+            'priority': 'high',
+            'evidence_based': True
+        })
+
+    # Workload issues
+    if any(word in all_responses_text for word in ['workload', 'deadline', 'pressure', 'demands']):
+        recommendations.append({
+            'action': 'Based on your workload concerns, schedule a structured conversation with your supervisor within the next week. Prepare a list of your current responsibilities and time commitments. Propose specific solutions like task prioritization, deadline adjustments, or resource allocation. Frame it as seeking support to maintain quality work rather than complaining about volume.',
+            'type': 'communication',
+            'priority': 'high',
+            'evidence_based': True
+        })
+
+    # Work-life balance issues
+    if any(word in all_responses_text for word in ['balance', 'personal', 'family', 'home', 'time']):
+        recommendations.append({
+            'action': 'Establish a clear "transition ritual" between work and personal time. This could be a 10-minute walk, changing clothes, or reviewing tomorrow\'s priorities before closing your work. Research shows that mental boundaries are crucial for preventing work stress from contaminating personal time and relationships.',
+            'type': 'boundary_setting',
+            'priority': 'medium',
+            'evidence_based': True
+        })
+
+    # Social/relationship issues
+    if any(word in all_responses_text for word in ['conflict', 'team', 'colleague', 'support', 'alone']):
+        recommendations.append({
+            'action': 'Focus on building one supportive workplace relationship this month. Identify a colleague you trust and suggest brief regular check-ins or coffee breaks. Social support at work is one of the strongest predictors of job satisfaction and stress resilience. Even small connections can significantly buffer workplace stress.',
+            'type': 'social_support',
+            'priority': 'medium',
+            'evidence_based': True
+        })
+
+    # General wellness if no specific issues detected
+    if len(recommendations) == 0:
+        recommendations = [
+            {
+                'action': 'Implement a daily 10-minute mindfulness practice using apps like Headspace or simple breathing exercises. Start with just 5 minutes if 10 feels overwhelming. Regular mindfulness practice has been shown to reduce workplace stress by 28% and improve emotional regulation within 4-6 weeks of consistent practice.',
+                'type': 'preventive',
+                'priority': 'medium',
+                'evidence_based': True
+            },
+            {
+                'action': 'Create a weekly stress review where you rate your stress levels and identify what contributed to good vs. difficult days. This self-awareness practice helps you recognize patterns and make proactive adjustments before stress becomes overwhelming. Use a simple 1-10 scale and note key triggers.',
+                'type': 'monitoring',
+                'priority': 'medium',
+                'evidence_based': True
+            },
+            {
+                'action': 'Prioritize sleep hygiene by establishing a consistent bedtime routine and aiming for 7-8 hours nightly. Poor sleep amplifies stress responses and reduces emotional resilience. Create a wind-down routine starting 1 hour before bed: dim lights, avoid screens, and try gentle stretching or reading.',
+                'type': 'wellness',
+                'priority': 'low',
+                'evidence_based': True
+            }
+        ]
+
+    return recommendations[:3]  # Return exactly 3 recommendations
+
+# ==================== RESPONSE ANALYSIS ====================
 
 def analyze_responses(questions, responses):
-    """Analyze user responses and generate insights for Burnout Risk"""
+    """Analyze responses using clinical AI guidelines with personalized AI recommendations"""
     try:
-        # Calculate Burnout Risk Score based on responses
-        total_risk_points = 0
-        scale_count = 0
-        stress_factors = []
+        # Get clinical AI instance
+        clinical_ai = get_clinical_ai()
 
-        for i, question in enumerate(questions):
-            response = responses[i] if i < len(responses) else None
+        if clinical_ai:
+            # Convert to format expected by clinical AI
+            user_responses = {}
+            for i, question in enumerate(questions):
+                if i < len(responses) and responses[i]:
+                    user_responses[question.get('category', f'question_{i}')] = responses[i]
 
-            if question['type'] == 'scale' and response is not None:
+            # Calculate basic burnout score for clinical context
+            burnout_score = calculate_basic_burnout_score(questions, responses)
+
+            # Get clinical context for AI recommendation generation
+            clinical_context = clinical_ai.kb.get_clinical_context(user_responses, burnout_score)
+
+            # Generate personalized AI recommendations based on user's specific answers
+            ai_recommendations = generate_personalized_ai_recommendations(user_responses, burnout_score, clinical_context)
+
+            # Get clinical analysis
+            clinical_analysis = clinical_ai.generate_clinical_analysis(user_responses, burnout_score)
+
+            # Convert clinical analysis to app format using AI-generated recommendations
+            analysis = {
+                'score': burnout_score,
+                'urgency': determine_urgency(burnout_score),
+                'concerns': extract_concerns_from_clinical(clinical_analysis),
+                'recommendations': ai_recommendations,  # Use AI-generated recommendations
+                'summary': clinical_analysis.get('analysis', 'Clinical analysis completed.'),
+                'clinical_sources': clinical_analysis.get('clinical_sources', []),
+                'confidence': clinical_analysis.get('confidence', 0.8)
+            }
+
+            logger.info(f"Clinical AI analysis completed - Score: {burnout_score:.1f}, AI Recommendations: {len(ai_recommendations)}")
+            return analysis
+
+        else:
+            # Fallback to basic analysis
+            logger.warning("Clinical AI not available, using fallback analysis")
+            return get_fallback_analysis(questions, responses)
+
+    except Exception as e:
+        logger.error(f"Clinical analysis error: {str(e)}")
+        return get_fallback_analysis(questions, responses)
+
+def calculate_basic_burnout_score(questions, responses):
+    """Calculate burnout score based on clinical assessment principles"""
+    total_risk = 0
+    scale_count = 0
+
+    for i, question in enumerate(questions):
+        if i >= len(responses) or not responses[i]:
+            continue
+
+        response = responses[i]
+        category = question.get('category', '')
+
+        if question['type'] == 'scale':
+            try:
                 scale_value = float(response)
                 scale_count += 1
 
-                # Convert scale responses to risk indicators
-                if question['category'] in ['stress']:
-                    # Higher stress directly contributes to higher risk
-                    total_risk_points += scale_value * 10
-                elif question['category'] in ['energy', 'satisfaction', 'balance']:
-                    # Lower energy/satisfaction/balance contributes to higher risk
-                    total_risk_points += (11 - scale_value) * 10
+                # Clinical scoring based on category
+                if category in ['anger_irritability', 'anxiety', 'fatigue', 'emotional_exhaustion']:
+                    # Higher values = more risk
+                    total_risk += scale_value * 10
+                elif category in ['vigour', 'energy', 'satisfaction']:
+                    # Lower values = more risk
+                    total_risk += (11 - scale_value) * 10
                 else:
-                    # General case for other questions - assume lower rating is worse
-                    total_risk_points += (11 - scale_value) * 10
+                    # Default: assume lower is worse
+                    total_risk += (11 - scale_value) * 10
 
-            elif question['type'] == 'text' and response:
-                # Analyze text for stress indicators
-                stress_keywords = ['overwhelmed', 'stressed', 'tired', 'burned', 'exhausted',
-                                   'pressure', 'deadline', 'too much', 'can\'t cope']
-                response_lower = response.lower()
+            except ValueError:
+                continue
 
-                for keyword in stress_keywords:
-                    if keyword in response_lower:
-                        stress_factors.append(f"Mentioned feeling {keyword}")
-                        total_risk_points += 15  # Add to risk score
+    # Calculate score (0-100)
+    if scale_count > 0:
+        score = min(100, total_risk / scale_count)
+    else:
+        score = 50
 
-        # Calculate final score (0-100, where higher = more burnout risk)
-        if scale_count > 0:
-            burnout_risk_score = min(100, total_risk_points / scale_count)
-        else:
-            burnout_risk_score = 50  # Default neutral score
+    return score
 
-        # Determine urgency level based on risk
-        if burnout_risk_score >= 70:
-            urgency = 'high'
-        elif burnout_risk_score >= 40:
-            urgency = 'medium'
-        else:
-            urgency = 'low'
+def determine_urgency(score):
+    """Determine urgency based on clinical thresholds"""
+    if score >= 70:
+        return 'high'
+    elif score >= 40:
+        return 'medium'
+    else:
+        return 'low'
 
-        # Generate concerns and recommendations
-        concerns = []
-        recommendations = []
+def extract_concerns_from_clinical(clinical_analysis):
+    """Extract concerns from clinical analysis"""
+    concerns = []
 
-        if burnout_risk_score >= 70:
-            concerns.extend(['High stress levels detected', 'Significant risk of burnout'])
-            recommendations.extend([
-                {'type': 'immediate', 'action': 'Take a break and practice deep breathing'},
-                {'type': 'urgent', 'action': 'Consider speaking with a manager about workload'},
-                {'type': 'support', 'action': 'Reach out to employee assistance program'}
-            ])
-        elif burnout_risk_score >= 40:
-            concerns.append('Moderate stress levels detected')
-            recommendations.extend([
-                {'type': 'immediate', 'action': 'Take a 10-minute mindfulness break'},
-                {'type': 'preventive', 'action': 'Schedule regular breaks throughout the day'},
-                {'type': 'module', 'title': 'Stress management techniques'}
-            ])
-        else:
-            recommendations.extend([
-                {'type': 'maintenance', 'action': 'Keep up the good work!'},
-                {'type': 'preventive', 'action': 'Continue daily check-ins'},
-                {'type': 'growth', 'action': 'Share wellness tips with colleagues'}
-            ])
+    structured = clinical_analysis.get('structured', {})
+    if structured.get('risk_factors'):
+        concerns.extend(structured['risk_factors'])
 
-        # Add text-based concerns
-        concerns.extend(stress_factors)
+    # Look for clinical indicators in analysis text
+    analysis_text = clinical_analysis.get('analysis', '').lower()
+    if 'high risk' in analysis_text:
+        concerns.append('High burnout risk identified by clinical assessment')
+    if 'professional help' in analysis_text:
+        concerns.append('Clinical recommendation for professional evaluation')
 
-        analysis = {
-            'score': round(burnout_risk_score, 1),
-            'urgency': urgency,
-            'concerns': concerns,
-            'recommendations': recommendations,
-            'summary': generate_summary(burnout_risk_score, concerns, urgency)
-        }
+    return concerns
 
-        return analysis
+def get_fallback_analysis(questions, responses):
+    """Fallback analysis when clinical AI is not available"""
+    # Calculate basic burnout score
+    burnout_score = calculate_basic_burnout_score(questions, responses)
+    urgency = determine_urgency(burnout_score)
 
-    except Exception as e:
-        logger.error(f"Analysis error: {str(e)}")
-        # Return safe fallback analysis
-        return {
-            'score': 50.0,
-            'urgency': 'medium',
-            'concerns': ['Unable to complete full analysis'],
-            'recommendations': [
-                {'type': 'immediate', 'action': 'Take a moment to reflect on your wellbeing'},
-                {'type': 'follow-up', 'action': 'Try completing another check-in tomorrow'}
-            ],
-            'summary': 'Analysis completed with limited data. Continue daily check-ins for better insights.'
-        }
+    # Convert responses to user_responses format for smart fallback
+    user_responses = {}
+    for i, question in enumerate(questions):
+        if i < len(responses) and responses[i]:
+            user_responses[question.get('category', f'question_{i}')] = responses[i]
+
+    # Basic rule-based concerns
+    concerns = []
+    if burnout_score >= 70:
+        concerns.extend(['High stress levels detected', 'Significant risk of burnout'])
+    elif burnout_score >= 40:
+        concerns.append('Moderate stress levels detected')
+
+    # Get smart recommendations based on responses
+    recommendations = get_smart_fallback_recommendations(user_responses, burnout_score)
+
+    return {
+        'score': burnout_score,
+        'urgency': urgency,
+        'concerns': concerns,
+        'recommendations': recommendations,
+        'summary': generate_summary(burnout_score, concerns, urgency),
+        'clinical_sources': [],
+        'confidence': 0.5
+    }
 
 def generate_summary(score, concerns, urgency):
     """Generate a summary based on analysis results"""
@@ -442,212 +892,56 @@ def generate_summary(score, concerns, urgency):
     else:
         return "You're managing well overall! Keep up the good habits and continue monitoring your wellbeing."
 
-# Update your existing submit_responses route to use clinical AI
-@app.route('/api/submit-responses', methods=['POST'])
+@app.route('/api/submit', methods=['POST'])
 def submit_responses():
-    """Submit daily responses with clinical AI analysis"""
+    """Submit questionnaire responses and get AI analysis"""
     try:
-        if 'user_id' not in session:
+        user_id = session.get('user_id')
+        if not user_id:
             return jsonify({'error': 'Authentication required'}), 401
 
         data = request.get_json()
-        responses = data.get('responses', {})
+        questions = data.get('questions', [])
+        responses = data.get('responses', [])
+        response_time = data.get('response_time_seconds', 0)
 
-        if not responses:
-            return jsonify({'error': 'No responses provided'}), 400
+        if not questions or not responses:
+            return jsonify({'error': 'Questions and responses are required'}), 400
 
-        user_id = session['user_id']
-        user = User.query.get(user_id)
+        # Analyze responses using clinical AI with personalized recommendations
+        analysis = analyze_responses(questions, responses)
 
-        if not user:
-            return jsonify({'error': 'User not found'}), 404
-
-        # Calculate burnout score
-        burnout_score = calculate_burnout_score(responses)
-        urgency_level = determine_urgency_level(burnout_score, responses)
-
-        # Generate clinical AI analysis
-        clinical_ai = get_clinical_ai()
-        if clinical_ai:
-            print("🧠 Generating clinical AI analysis...")
-            clinical_analysis = clinical_ai.generate_clinical_analysis(responses, burnout_score)
-
-            # Extract recommendations and concerns from clinical analysis
-            ai_recommendations = extract_clinical_recommendations(clinical_analysis)
-            concerns = extract_clinical_concerns(clinical_analysis, responses)
-        else:
-            print("⚠️ Clinical AI not available, using fallback")
-            clinical_analysis = {}
-            ai_recommendations = get_fallback_recommendations(burnout_score, urgency_level)
-            concerns = extract_concerns_from_responses(responses)
-
-        # Create response record
+        # Save to database
         daily_response = DailyResponse(
             user_id=user_id,
+            questions=json.dumps(questions),
             responses=json.dumps(responses),
-            burnout_score=burnout_score,
-            urgency_level=urgency_level,
-            concerns=json.dumps(concerns),
-            recommendations=json.dumps(ai_recommendations),
-            ai_analysis=json.dumps(clinical_analysis)  # Store full clinical analysis
+            burnout_score=analysis['score'],
+            ai_analysis=json.dumps(analysis),
+            concerns=json.dumps(analysis['concerns']),
+            recommendations=json.dumps(analysis['recommendations']),
+            urgency_level=analysis['urgency'],
+            response_time_seconds=response_time
         )
 
         db.session.add(daily_response)
-
-        # Update user's last active
-        user.last_active = datetime.utcnow()
         db.session.commit()
 
-        print(f"✅ Responses submitted for user {user_id[:8]}... (Score: {burnout_score})")
+        logger.info(f"Clinical AI analysis completed for user {user_id[:8]}... Score: {analysis['score']:.1f}, Urgency: {analysis['urgency']}")
 
         return jsonify({
             'success': True,
-            'burnout_score': burnout_score,
-            'urgency_level': urgency_level,
-            'concerns': concerns,
-            'recommendations': ai_recommendations,
-            'clinical_sources': clinical_analysis.get('clinical_sources', []),
-            'confidence': clinical_analysis.get('confidence', 0.0),
-            'message': 'Responses submitted successfully'
+            'analysis': analysis,
+            'message': 'Response analyzed and submitted successfully'
         })
 
     except Exception as e:
-        print(f"❌ Error submitting responses: {e}")
+        logger.error(f"Response submission error: {str(e)}")
         db.session.rollback()
-        return jsonify({'error': 'Failed to submit responses'}), 500
+        return jsonify({'error': 'Failed to submit response'}), 500
 
-# Add new function to extract clinical recommendations
-def extract_clinical_recommendations(clinical_analysis: dict) -> list:
-    """Extract actionable recommendations from clinical AI analysis"""
-    if not clinical_analysis:
-        return get_fallback_recommendations(5, 'medium')
-
-    recommendations = []
-
-    # Extract from structured analysis
-    structured = clinical_analysis.get('structured', {})
-    if structured.get('recommendations'):
-        recommendations.extend(structured['recommendations'])
-
-    # Extract from interventions
-    if structured.get('interventions'):
-        recommendations.extend(structured['interventions'])
-
-    # If no structured recommendations, parse from text
-    if not recommendations:
-        analysis_text = clinical_analysis.get('analysis', '')
-        recommendations = parse_recommendations_from_text(analysis_text)
-
-    # Ensure we have some recommendations
-    if not recommendations:
-        recommendations = [
-            "Consider discussing workplace stress with your supervisor",
-            "Practice stress management techniques like deep breathing",
-            "Maintain work-life boundaries",
-            "Seek support from Employee Assistance Programs if available"
-        ]
-
-    return recommendations[:5]  # Limit to 5 recommendations
-
-def extract_clinical_concerns(clinical_analysis: dict, responses: dict) -> list:
-    """Extract concerns from clinical analysis and responses"""
-    concerns = []
-
-    if clinical_analysis:
-        structured = clinical_analysis.get('structured', {})
-
-        # Add risk factors as concerns
-        if structured.get('risk_factors'):
-            concerns.extend(structured['risk_factors'])
-
-        # Check if professional help is recommended
-        if structured.get('professional_help'):
-            concerns.append("Consider seeking professional mental health support")
-
-    # Extract from responses
-    response_concerns = extract_concerns_from_responses(responses)
-    concerns.extend(response_concerns)
-
-    return list(set(concerns))  # Remove duplicates
-
-def parse_recommendations_from_text(text: str) -> list:
-    """Parse recommendations from AI analysis text"""
-    recommendations = []
-    lines = text.split('\n')
-
-    for line in lines:
-        line = line.strip()
-        if line.startswith(('-', '•', '*')) or 'recommend' in line.lower():
-            # Clean up the recommendation
-            rec = line.lstrip('-•* ').strip()
-            if len(rec) > 10:  # Only include substantial recommendations
-                recommendations.append(rec)
-
-    return recommendations
-# Add new route for clinical guidelines info
-@app.route('/api/clinical-sources')
-def get_clinical_sources():
-    """Get information about clinical sources used"""
-    try:
-        if not clinical_kb or not clinical_kb.collection:
-            return jsonify({
-                'sources': [],
-                'message': 'Clinical guidelines not loaded'
-            })
-
-        # Get collection info
-        collection_count = clinical_kb.collection.count()
-
-        # Sample some guidelines to show sources
-        sample_guidelines = clinical_kb.query_guidelines("burnout workplace mental health", n_results=5)
-
-        sources = []
-        for guideline in sample_guidelines:
-            meta = guideline['metadata']
-            sources.append({
-                'source': meta['source'],
-                'topic': meta['topic'],
-                'evidence_level': meta['evidence_level'],
-                'citation': meta['citation']
-            })
-
-        return jsonify({
-            'total_guidelines': collection_count,
-            'sources': sources,
-            'message': f'Loaded {collection_count} clinical guidelines'
-        })
-
-    except Exception as e:
-        print(f"Error getting clinical sources: {e}")
-        return jsonify({'error': 'Failed to get clinical sources'}), 500
-
-# Add route to reload guidelines (for development)
-@app.route('/api/reload-guidelines', methods=['POST'])
-def reload_guidelines():
-    """Reload clinical guidelines from PDFs (development only)"""
-    try:
-        if not app.debug:
-            return jsonify({'error': 'Only available in debug mode'}), 403
-
-        # Clear existing collection
-        if clinical_kb and clinical_kb.collection:
-            clinical_kb.client.delete_collection("clinical_guidelines")
-            clinical_kb.collection = clinical_kb.client.create_collection("clinical_guidelines")
-
-        # Reload guidelines
-        guidelines_dir = os.path.join(app.instance_path, 'guidelines')
-        if os.path.exists(guidelines_dir):
-            from clinical_ai import load_pdf_guidelines
-            load_pdf_guidelines(guidelines_dir)
-            return jsonify({'success': True, 'message': 'Guidelines reloaded'})
-        else:
-            return jsonify({'error': 'Guidelines directory not found'}), 404
-
-    except Exception as e:
-        return jsonify({'error': f'Failed to reload guidelines: {e}'}), 500
 # ==================== API ROUTES ====================
 
-# Update your existing user-data route to include clinical info
 @app.route('/api/user-data')
 def get_user_data():
     """Get user dashboard data with clinical insights"""
@@ -667,7 +961,7 @@ def get_user_data():
         ).order_by(DailyResponse.created_at.desc()).limit(30).all()
 
         # Calculate trends
-        scores = [r.burnout_score for r in recent_responses]
+        scores = [r.burnout_score for r in recent_responses if r.burnout_score is not None]
         trend = calculate_trend(scores)
 
         # Get latest clinical analysis if available
@@ -700,11 +994,10 @@ def get_user_data():
         })
 
     except Exception as e:
-        print(f"❌ Error getting user data: {e}")
+        logger.error(f"User data error: {str(e)}")
         return jsonify({'error': 'Failed to get user data'}), 500
 
-# Add this helper function
-def calculate_trend(scores: list) -> str:
+def calculate_trend(scores):
     """Calculate trend from recent scores"""
     if len(scores) < 2:
         return 'insufficient_data'
@@ -864,6 +1157,42 @@ def export_user_data():
     except Exception as e:
         logger.error(f"Export error: {str(e)}")
         return jsonify({'error': 'Export failed'}), 500
+
+@app.route('/api/clinical-sources')
+def get_clinical_sources():
+    """Get information about clinical sources used"""
+    try:
+        if not clinical_kb or not clinical_kb.collection:
+            return jsonify({
+                'sources': [],
+                'message': 'Clinical guidelines not loaded'
+            })
+
+        # Get collection info
+        collection_count = clinical_kb.collection.count()
+
+        # Sample some guidelines to show sources
+        sample_guidelines = clinical_kb.query_guidelines("burnout workplace mental health", n_results=5)
+
+        sources = []
+        for guideline in sample_guidelines:
+            meta = guideline['metadata']
+            sources.append({
+                'source': meta['source'],
+                'topic': meta['topic'],
+                'evidence_level': meta['evidence_level'],
+                'citation': meta['citation']
+            })
+
+        return jsonify({
+            'total_guidelines': collection_count,
+            'sources': sources,
+            'message': f'Loaded {collection_count} clinical guidelines'
+        })
+
+    except Exception as e:
+        logger.error(f"Error getting clinical sources: {e}")
+        return jsonify({'error': 'Failed to get clinical sources'}), 500
 
 # ==================== HELPER FUNCTIONS ====================
 
@@ -1055,7 +1384,8 @@ def not_found(error):
             '/api/user-progress',
             '/api/company-analytics',
             '/api/emergency-help',
-            '/api/export-data'
+            '/api/export-data',
+            '/api/clinical-sources'
         ]
     }), 404
 
@@ -1113,6 +1443,7 @@ if __name__ == '__main__':
     print("   • /api/user-data - Demo dashboard data")
     print("   • /api/company-analytics - Company insights")
     print("   • /api/emergency-help - Emergency features")
+    print("   • /api/clinical-sources - Clinical guidelines info")
     print("\n🛑 Press Ctrl+C to stop the server")
     print("=" * 50)
 
